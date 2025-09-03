@@ -111,10 +111,15 @@ namespace {
 #endif
 } // anonymous
 
+bool starts_with(const std::string& str, const std::string& prefix) {
+    return str.size() >= prefix.size() && str.compare(0, prefix.size(), prefix) == 0;
+}
+
 namespace ycsbc {
 
 std::vector<rocksdb::ColumnFamilyHandle *> RocksdbDB::cf_handles_;
 rocksdb::DB *RocksdbDB::db_ = nullptr;
+std::shared_ptr<rocksdb::Env> RocksdbDB::env_guard_{};
 int RocksdbDB::ref_cnt_ = 0;
 std::mutex RocksdbDB::mu_;
 
@@ -201,24 +206,39 @@ void RocksdbDB::Init() {
   opt.merge_operator.reset(new YCSBUpdateMerge);
 #endif
 
+  std::string actual_db_path;
+  if (db_path == "FMC" || starts_with(db_path, "FMC:")) {
+    rocksdb::ConfigOptions config_options;
+    rocksdb::Env* env = nullptr;
+    rocksdb::Status s = rocksdb::Env::CreateFromUri(config_options, "", db_path, &env, &env_guard_);
+    if (!s.ok()) {
+      throw utils::Exception(std::string("RocksDB CreateFromUri: ") + s.ToString());
+    }
+    opt.env = env;
+    actual_db_path = "/tmp/ycsb-rocksdb-fmc-data";
+  } else {
+    opt.env = rocksdb::Env::Default();
+    actual_db_path = db_path;
+  }
+
   rocksdb::Status s;
   if (props.GetProperty(PROP_DESTROY, PROP_DESTROY_DEFAULT) == "true") {
-    s = rocksdb::DestroyDB(db_path, opt);
+    s = rocksdb::DestroyDB(actual_db_path, opt);
     if (!s.ok()) {
       throw utils::Exception(std::string("RocksDB DestroyDB: ") + s.ToString());
     }
   }
   if (cf_descs.empty()) {
-    s = rocksdb::DB::Open(opt, db_path, &db_);
+    s = rocksdb::DB::Open(opt, actual_db_path, &db_);
   } else {
-    s = rocksdb::DB::Open(opt, db_path, cf_descs, &cf_handles_, &db_);
+    s = rocksdb::DB::Open(opt, actual_db_path, cf_descs, &cf_handles_, &db_);
   }
   if (!s.ok()) {
     throw utils::Exception(std::string("RocksDB Open: ") + s.ToString());
   }
 }
 
-void RocksdbDB::Cleanup() { 
+void RocksdbDB::Cleanup() {
   const std::lock_guard<std::mutex> lock(mu_);
   if (--ref_cnt_) {
     return;
@@ -230,6 +250,8 @@ void RocksdbDB::Cleanup() {
     }
   }
   delete db_;
+  db_ = nullptr;
+  env_guard_.reset();
 }
 
 void RocksdbDB::GetOptions(const utils::Properties &props, rocksdb::Options *opt,
